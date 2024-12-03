@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import argparse
 import sys
 import time
 
@@ -8,173 +7,258 @@ import adapy
 import numpy as np
 import rospy
 
-from adarrt import AdaRRT
-
 if sys.version_info[0] < 3:
     current_time = time.clock
-    user_input = raw_input
 else:
     current_time = time.process_time
-    user_input = input
 
-def createBw():
+class AdaRRT():
     """
-    Creates the bounds matrix for the TSR.
-
-    :returns: A 6x2 array Bw
+    Rapidly-Exploring Random Trees (RRT) for the ADA controller.
     """
-    ### FILL in your code here (Q2 and Q3)
-    Bw = np.array([
-        [0, 0], # xmin, xmax
-        [0, 0], # ymin, ymax
-        [0, 0], # zmin, zmax
-        [0, 0], # roll_min, roll_max
-        [0, 0], # pitch_min, pitch_max
-        [0, np.pi]  # yaw_min, yaw_max
-    ])
+    joint_lower_limits = np.array([-3.14, 1.57, 0.33, -3.14, 0, 0])
+    joint_upper_limits = np.array([3.14, 5.00, 5.00, 3.14, 3.14, 3.14])
 
-    ###
-    return Bw
+    class Node():
+        """
+        A node for a doubly-linked tree structure.
+        """
+        def __init__(self, state, parent):
+            """
+            :param state: np.array of a state in the search space.
+            :param parent: parent Node object.
+            """
+            self.state = np.asarray(state)
+            self.parent = parent
+            self.children = []
 
-def createSodaTSR(soda_pose, hand):
-    """
-    Create the TSR for grasping a soda can.
+        def __iter__(self):
+            """
+            Breadth-first iterator.
+            """
+            nodelist = [self]
+            while nodelist:
+                node = nodelist.pop(0)
+                nodelist.extend(node.children)
+                yield node
 
-    :param soda_pose: SE(3) transform from world to soda can.
-    :param hand: ADA hand object
-    :returns: A fully initialized TSR.
-    """
-    sodaTSR = adapy.get_default_TSR()
-    sodaTSR.set_T0_w(soda_pose)
+        def __repr__(self):
+            return 'Node({})'.format(', '.join(map(str, self.state)))
 
-    rot_trans = np.eye(4)
-    rot_trans[0:3, 0:3] = np.array([[0,  0, -1],
-                                    [1,  0,  0],
-                                    [0, -1,  0]])
-    sodaTSR_Tw_e = np.matmul(
-        rot_trans, hand.get_endeffector_transform("cylinder"))
-    sodaTSR_Tw_e[0,3] = -0.04
-    sodaTSR_Tw_e[2,3] = 0.06
+        def add_child(self, state):
+            """
+            Adds a new child at the given state.
 
-    sodaTSR.set_Tw_e(sodaTSR_Tw_e)
-    Bw = createBw()
-    sodaTSR.set_Bw(Bw)
-    return sodaTSR
+            :param state: np.array of new child node's statee
+            :returns: child Node object.
+            """
+            child = AdaRRT.Node(state=state, parent=self)
+            self.children.append(child)
+            return child
 
-def van_der_corput(n_sample, base=2):
-    """
-    Van der Corput sequence.
+    def __init__(self,
+                 start_state,
+                 goal_state,
+                 ada,
+                 joint_lower_limits=None,
+                 joint_upper_limits=None,
+                 ada_collision_constraint=None,
+                 step_size=0.25,
+                 goal_precision=1.0,
+                 max_iter=10000):
+        """
+        :param start_state: Array representing the starting state.
+        :param goal_state: Array representing the goal state.
+        :param ada: libADA instance.
+        :param joint_lower_limits: List of lower bounds of each joint.
+        :param joint_upper_limits: List of upper bounds of each joint.
+        :param ada_collision_constraint: Collision constraint object.
+        :param step_size: Distance between nodes in the RRT.
+        :param goal_precision: Maximum distance between RRT and goal before
+            declaring completion.
+        :param sample_near_goal_prob:
+        :param sample_near_goal_range:
+        :param max_iter: Maximum number of iterations to run the RRT before
+            failure.
+        """
+        self.start = AdaRRT.Node(start_state, None)
+        self.goal = AdaRRT.Node(goal_state, None)
+        self.ada = ada
+        self.joint_lower_limits = joint_lower_limits or AdaRRT.joint_lower_limits
+        self.joint_upper_limits = joint_upper_limits or AdaRRT.joint_upper_limits
+        self.ada_collision_constraint = ada_collision_constraint
+        self.step_size = step_size
+        self.goal_precision = goal_precision
+        self.max_iter = max_iter
 
-    :param n_sample: number of elements in the sequence.
-    :param base: base of the sequence.
-    :return: The Van der Corput as a list.
-    """
-    sequence = []
-    for i in range(n_sample):
-        n_th_number, denom = 0., 1.
-        while i > 0:
-            i, remainder = divmod(i, base)
-            denom *= base
-            n_th_number += remainder / denom
-        sequence.append(n_th_number)
+    def build(self):
+        """
+        Build an RRT.
 
-    return sequence
+        In each step of the RRT:
+            1. Sample a random point.
+            2. Find its nearest neighbor.
+            3. Attempt to create a new node in the direction of sample from its
+                nearest neighbor.
+            4. If we have created a new node, check for completion.
 
-def try_shortcut(
-        start_pos, end_pos, ada, collision_constraint, sequence):
-    """
-    Sample between 2 points to check for collision.
-    """
-    skeleton = ada.get_arm_skeleton()
-    state_space = ada.get_arm_state_space()
+        Once the RRT is complete, add the goal node to the RRT and build a path
+        from start to goal.
 
-    for point in sequence:
-        interpolated = start_pos + (end_pos - start_pos) * point
-        if not collision_constraint.is_satisfied(
-                state_space, skeleton, interpolated):
+        :returns: A list of states that create a path from start to
+            goal on success. On failure, returns None.
+        """
+        for k in range(self.max_iter):
+            # FILL in your code here
+            ch=np.random.choice(2,1, p=[0.8, 0.2])
+            if ch==0:
+                rsam=self._get_random_sample()
+            else:
+                rsam=self._get_random_sample_near_goal()
+
+            #rsam=self._get_random_sample()
+            nn = self._get_nearest_neighbor(rsam)
+            new_node = self._extend_sample(rsam, nn)
+            if new_node and self._check_for_completion(new_node):
+                # FILL in your code here
+                goal_node = new_node.add_child(self.goal.state)
+                path = self._trace_path_from_start(goal_node)
+                return path
+
+        print("Failed to find path from {0} to {1} after {2} iterations!".format(
+            self.start.state, self.goal.state, self.max_iter))
+    
+    def _get_random_sample_near_goal(self):
+        sample=np.empty(self.start.state.shape[0])
+        for i in range(self.start.state.shape[0]):
+            A=np.arange(self.goal.state[i]-0.05,self.goal.state[i]+0.05,0.1)
+            sample[i]=np.random.choice(A)
+        return sample
+
+    def _get_random_sample(self):
+        """
+        Uniformly samples the search space.
+
+        :returns: A vector representing a randomly sampled point in the search
+            space.
+        """
+        # FILL in your code here
+        sample=np.empty(self.start.state.shape[0])
+        for i in range(self.start.state.shape[0]):
+            A=np.arange(self.joint_lower_limits[i],self.joint_upper_limits[i],0.1)
+            sample[i]=np.random.choice(A)
+        return sample
+
+    def _get_nearest_neighbor(self, sample):
+        """
+        Finds the closest node to the given sample in the search space,
+        excluding the goal node.
+
+        :param sample: The target point to find the closest neighbor to.
+        :returns: A Node object for the closest neighbor.
+        """
+        # FILL in your code here
+        nodelist=self.start.__iter__()
+        # min dist starts as infinity
+        min_dist=float('inf')
+        for node in nodelist:
+            dist=np.linalg.norm(node.state-sample)
+            if dist < min_dist:
+                min_dist=dist
+                nn=node
+        return nn
+
+    def _extend_sample(self, sample, neighbor):
+        """
+        Adds a new node to the RRT between neighbor and sample, at a distance
+        step_size away from neighbor. The new node is only created if it will
+        not collide with any of the collision objects (see
+        RRT._check_for_collision)
+
+        :param sample: target point
+        :param neighbor: closest existing node to sample
+        :returns: The new Node object. On failure (collision), returns None.
+        """
+        # FILL in your code here
+        if np.linalg.norm(sample-neighbor.state)<=self.step_size:
+            new_node_state=sample
+            if self._check_for_collision(new_node_state):
+                return
+            new_node=neighbor.add_child(new_node_state) 
+        else:
+            u=(sample-neighbor.state)/np.linalg.norm(sample-neighbor.state)#(np.sqrt(np.sum((sample-neighbor.state)**2)))
+            new_node_state=neighbor.state+u*self.step_size
+            if self._check_for_collision(new_node_state):
+                return
+            new_node=neighbor.add_child(new_node_state)
+        return new_node
+
+    def _check_for_completion(self, node):
+        """
+        Check whether node is within self.self.goal_precision distance of the goal.
+
+        :param node: The target Node
+        :returns: Boolean indicating node is close enough for completion.
+        """
+        # FILL in your code here
+        return np.linalg.norm(np.absolute(self.goal.state-node.state)) <= self.goal_precision
+
+    def _trace_path_from_start(self, node=None):
+        """
+        Traces a path from start to node, if provided, or the goal otherwise.
+
+        :param node: The target Node at the end of the path. Defaults to
+            self.goal
+        :returns: A list of states (not Nodes!) beginning at the start state and
+            ending at the goal state.
+        """
+        # FILL in your code here
+        if node is None:
+            node = self.goal
+        nodeList = []
+        while node is not None:
+            nodeList.append(node.state)
+            node = node.parent
+        return nodeList[::-1]
+        
+
+    def _check_for_collision(self, sample):
+        """
+        Checks if a sample point is in collision with any collision object.
+
+        :returns: A boolean value indicating that sample is in collision.
+        """
+        if self.ada_collision_constraint is None:
             return False
-    return True
+        return not self.ada_collision_constraint.is_satisfied(
+            self.ada.get_arm_state_space(),
+            self.ada.get_arm_skeleton(), sample)
 
-def shortcut(waypoints, ada, collision_constraint, time_limit=7.0):
-    """
-    Smooth a path by sparsifying it.
-    """
-    sequence = van_der_corput(300)
-    if collision_constraint is None:
-        return waypoints
-    start_time = time.time()
-    elapsed_time = time.time() - start_time
-    while elapsed_time < time_limit:
-        length = len(waypoints)
-        start_idx = np.random.randint(0, length - 1)
-        end_idx = np.random.randint(start_idx + 1, length)
 
-        if try_shortcut(waypoints[start_idx],
-                        waypoints[end_idx],
-                        ada,
-                        collision_constraint,
-                        sequence):
-            print("shortcutting...")
-            del waypoints[start_idx + 1: end_idx]
-
-        elapsed_time = time.time() - start_time
-
-def close_hand(hand, preshape):
-    """
-    Close the hand on the ADA.
-
-    :param hand: ADA hand object
-    :param preshape: The joint values as (f1, f2)
-    :returns: None
-    """
-    if (len(preshape) != 2 or
-        preshape[0] < 0. or preshape[0] > 1.6 or
-        preshape[1] < 0. or preshape[1] > 1.6):
-        print("bad preshape input.")
-        return
-    hand.execute_preshape(preshape)
-
-def main(if_sim):
-    # initialize roscpp, if it's for real robot
-    # http://wiki.ros.org/ROS/Tutorials/Using%20a%20C%2B%2B%20class%20in%20Python
-    if not if_sim:
-        from moveit_ros_planning_interface._moveit_roscpp_initializer import roscpp_init
-        roscpp_init('soda_grasp_ik', [])
+def main():
+    sim = True
 
     # instantiate an ada
-    ada = adapy.Ada(if_sim)
+    ada = adapy.Ada(True)
+
+    armHome = [-1.5, 3.22, 1.23, -2.19, 1.8, 1.2]
+    goalConfig = [-1.72, 4.44, 2.02, -2.04, 2.66, 1.39]
+    delta = 0.25
+    eps = 1.0
+
+    if sim:
+        ada.set_positions(goalConfig)
 
     # launch viewer
-    viewer = ada.start_viewer("dart_markers/sode_grasp", "map")
+    viewer = ada.start_viewer("dart_markers/simple_trajectories", "map")
     world = ada.get_world()
-    hand = ada.get_hand()
-    hand_node = hand.get_endeffector_body_node()
-    arm_skeleton = ada.get_arm_skeleton()
-    arm_state_space = ada.get_arm_state_space()
-
-    # joint positions of the starting pose
-    arm_home = [-1.5, 3.22, 1.23, -2.19, 1.8, 1.2]
-
-    if if_sim:
-        ada.set_positions(arm_home)
-    else:
-        user_input("Please move arm to home position with the joystick. " +
-            "Press ENTER to continue...")
-
-    viewer.add_frame(hand_node)
 
     # add objects to world
     soda_pose = np.eye(4)
     soda_pose[0, 3] = 0.25
     soda_pose[1, 3] = -0.35
     sodaURDFUri = "package://pr_assets/data/objects/can.urdf"
-    soda = world.add_body_from_urdf_matrix(sodaURDFUri, soda_pose)
-
-    bowl_pose = np.eye(4)
-    bowl_pose[0, 3] = 0.40
-    bowl_pose[1, 3] = -0.25
-    bowlURDFUri = "package://pr_assets/data/objects/plastic_bowl.urdf"
-    bowl = world.add_body_from_urdf_matrix(bowlURDFUri, bowl_pose)
+    can = world.add_body_from_urdf_matrix(sodaURDFUri, soda_pose)
 
     tableURDFUri = "package://pr_assets/data/furniture/uw_demo_table.urdf"
     # x, y, z, rw, rx, ry, rz
@@ -183,163 +267,41 @@ def main(if_sim):
 
     # add collision constraints
     collision_free_constraint = ada.set_up_collision_detection(
-        ada.get_arm_state_space(),
-        ada.get_arm_skeleton(),
-        [soda, bowl, table])
+            ada.get_arm_state_space(),
+            ada.get_arm_skeleton(),
+            [can, table])
     full_collision_constraint = ada.get_full_collision_constraint(
-        ada.get_arm_state_space(),
-        ada.get_arm_skeleton(),
-        collision_free_constraint)
+            ada.get_arm_state_space(),
+            ada.get_arm_skeleton(),
+            collision_free_constraint)
 
-    rospy.sleep(1.)
-    user_input("Press ENTER to generate the TSR...")
+    # easy goal
+    adaRRT = AdaRRT(
+        start_state=np.array(armHome),
+        goal_state=np.array(goalConfig),
+        ada=ada,
+        ada_collision_constraint=full_collision_constraint,
+        step_size=delta,
+        goal_precision=eps)
 
-    # create TSR
-    sodaTSR = createSodaTSR(soda_pose, hand)
-    marker = viewer.add_tsr_marker(sodaTSR)
-    user_input("Press ENTER to start planning goals...")
+    rospy.sleep(1.0)
 
-    # set up IK generator
-    ik_sampleable = adapy.create_ik(
-        arm_skeleton,
-        arm_state_space,
-        sodaTSR,
-        hand_node)
-    ik_generator = ik_sampleable.create_sample_generator()
-    configurations = []
+    path = adaRRT.build()
+    if path is not None:
+        print("Path waypoints:")
+        print(np.asarray(path))
+        waypoints = []
+        for i, waypoint in enumerate(path):
+            waypoints.append((0.0 + i, waypoint))
 
-    samples = 0
-    maxSamples = 10
-    while samples < maxSamples and ik_generator.can_sample():
-        goal_state = ik_generator.sample(arm_state_space)
-        samples += 1
-        if len(goal_state) == 0:
-            continue
-        configurations.append(goal_state)
-
-    if len(configurations) == 0:
-        print("No valid configurations found!")
-
-    if if_sim:
-        ada.set_positions(arm_home)
-
-    user_input("Press ENTER to start RRT planning...")
-    trajectory = None
-    for configuration in configurations:
-        # Your AdaRRT planner
-        ### FILL in your code here (Q4)
-        adaRRT = AdaRRT(
-            start_state=np.array(arm_home),
-            goal_state=np.array(configuration),
-            ada=ada,
-            ada_collision_constraint=full_collision_constraint,
-            step_size=0.25,
-            goal_precision=1.0
-        )
+        t0 = current_time()
+        traj = ada.compute_joint_space_path(
+            ada.get_arm_state_space(), waypoints)
+        t = current_time() - t0
+        print(str(t) + "seconds elapsed")
+        input('Press ENTER to execute trajectory and exit')
+        ada.execute_trajectory(traj)
         rospy.sleep(1.0)
-        trajectory = adaRRT.build()
-
-        ###
-        if trajectory:
-            break
-
-    if not trajectory:
-        print("Failed to find a solution!")
-        sys.exit(1)
-    else:
-        print("Found a trajectory!")
-
-    # smooth the RRTs trajectory
-    shortcut(trajectory, ada, full_collision_constraint)
-    waypoints = []
-    for i, waypoint in enumerate(trajectory):
-        waypoints.append((0.0 + i, waypoint))
-
-    # compute trajectory in joint space
-    t0 = current_time()
-    traj = ada.compute_joint_space_path(ada.get_arm_state_space(), waypoints)
-    retimed_traj = ada.compute_retime_path(ada.get_arm_skeleton(), traj)
-    t = current_time() - t0
-    print(str(t) + " seconds elapsed")
-    user_input('Press ENTER to execute the trajectory...')
-
-    # execute the trajectory
-    if not if_sim:
-        ada.start_trajectory_executor()
-    ada.execute_trajectory(retimed_traj)
-    time.sleep(0.05)
-    user_input('Press ENTER after robot has approached the can...')
-    if not if_sim:
-        ada.set_positions(waypoints[-1][1])
-
-    # execute the grasp
-    print("Closing hand")
-    ### FILL in your code here (Q5)
-    preshape = [1,1]
-    close_hand(hand, preshape)
-    ###
-
-    user_input('Press ENTER after robot has succeeded closing the hand...')
-    if if_sim:
-        hand.grab(soda)
-
-    # compute the Jacobian pseudo-inverse for moving the hand upwards
-    ### FILL in your code here (Q6 and Q7)
-    q = arm_skeleton.get_positions()
-
-    def move_dir(q, delt_x, steps):
-        for i in range(steps):
-            J = arm_skeleton.get_jacobian(hand.get_endeffector_body_node())
-            Jt = np.transpose(J)
-            J_Jt_Dot = np.dot(J, Jt)
-            inverse = np.linalg.inv(J_Jt_Dot)
-            J_dot_inv = np.dot(Jt,inverse)
-            delt_q_err = np.dot(J_dot_inv,  delt_x)
-            print(delt_q_err)
-            q -= delt_q_err
-
-            if if_sim:
-                ada.set_positions(q)
-                viewer.update()
-                time.sleep(0.10)
-        
-        if not if_sim:
-		    # in real world
-            traj = ada.plan_to_configuration(ada.get_arm_state_space(), ada.get_arm_skeleton(), q)
-            retimed_traj = ada.compute_retime_path(ada.get_arm_skeleton(), traj)
-            ada.execute_trajectory(retimed_traj)
-            time.sleep(0.50)
-        
-        return q
-    
-
-    print("Lifting can...")
-    q = move_dir(q, np.array([0,0,0,-0.01,0,0]), 50)
-    time.sleep(5)
-
-    # This section onwards is for the in-person lab
-
-    print("Lowering can...")
-    q = move_dir(q, np.array([0,0,0,0.01,0,0]), 42)
-    time.sleep(5)
-    
-    print("Moving forward...")
-    q = move_dir(q, np.array([0,0,0,0,0,-0.01]), 20)
-    time.sleep(5)
-
-    print("Rotating can...")
-    q = move_dir(q, np.array([0,0,0.03,0,0,0]), 50)
-    user_input('Press ENTER after robot has succeeded rotating can...')
-
-    # clean the scene
-    # world.remove_skeleton(soda)
-    # world.remove_skeleton(table)
-
 
 if __name__ == '__main__':
-   parser = argparse.ArgumentParser()
-   parser.add_argument('--sim', dest='if_sim', action='store_true')
-   parser.add_argument('--real', dest='if_sim', action='store_false')
-   parser.set_defaults(if_sim=True)
-   args = parser.parse_args()
-   main(args.if_sim)
+    main()
